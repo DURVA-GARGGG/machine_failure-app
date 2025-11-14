@@ -1,82 +1,69 @@
 import streamlit as st
 import numpy as np
+import pandas as pd
 import pickle
 
-with open("models/final_model_pipeline_lr.pkl", "rb") as f:
-    model_lr = pickle.load(f)
+st.set_page_config(page_title="Machine Failure Prediction", layout="wide")
 
-with open("models/final_model_pipeline_rfr.pkl", "rb") as f:
-    model_rf = pickle.load(f)
+st.title("⚙️ Machine Failure Prediction App")
+st.write("Upload your machine parameters to predict whether failure will occur.")
 
-with open("models/final_model_pipeline_xgb.pkl", "rb") as f:
-    model_xgb = pickle.load(f)
+# -------------------------------
+# Load Models
+# -------------------------------
+@st.cache_resource
+def load_model(path):
+    with open(path, "rb") as f:
+        return pickle.load(f)
 
-with open("models/final_model_pipeline_lgb.pkl", "rb") as f:
-    model_lgbm = pickle.load(f)
+model_paths = {
+    "Logistic Regression": "models/final_model_pipeline_lr.pkl",
+    "LightGBM": "models/final_model_pipeline_lgb.pkl",
+    "Random Forest": "models/final_model_pipeline_rfr.pkl",
+    "XGBoost": "models/final_model_pipeline_xgb.pkl",
+}
 
-# --------------------------
-# Load all 4 trained models
-# --------------------------
-with open("logistic_reg.pkl", "rb") as f:
-    model_lr = pickle.load(f)
+loaded_models = {
+    name: load_model(path) for name, path in model_paths.items()
+}
 
-with open("rf_model.pkl", "rb") as f:
-    model_rf = pickle.load(f)
+# -------------------------------
+# User Input
+# ---------------------------
+st.sidebar.header("Input Features")
 
-with open("xgb_model.pkl", "rb") as f:
-    model_xgb = pickle.load(f)
+air_temp = st.sidebar.number_input("Air Temperature (°C)", 250, 400, 300)
+process_temp = st.sidebar.number_input("Process Temperature (°C)", 250, 400, 305)
+rot_speed = st.sidebar.number_input("Rotational Speed (rpm)", 500, 5000, 1800)
+torque = st.sidebar.number_input("Torque (Nm)", 0, 100, 40)
+tool_wear = st.sidebar.number_input("Tool Wear (min)", 0, 300, 150)
 
-with open("lgbm_model.pkl", "rb") as f:
-    model_lgbm = pickle.load(f)
+model_choice = st.sidebar.selectbox(
+    "Choose Prediction Model", list(loaded_models.keys())
+)
 
-# --------------------------
-# App UI
-# --------------------------
-st.set_page_config(page_title="Machine Failure Prediction", page_icon="⚙️")
+input_data = pd.DataFrame({
+    "Air temperature [K]": [air_temp + 273],
+    "Process temperature [K]": [process_temp + 273],
+    "Rotational speed [rpm]": [rot_speed],
+    "Torque [Nm]": [torque],
+    "Tool wear [min]": [tool_wear],
+})
 
-st.title("Machine Failure Prediction App")
-st.write("Enter the machine parameters below:")
+# -------------------------------
+# Predict
+# -------------------------------
+if st.button("Predict Failure "):
+    model = loaded_models[model_choice]
+    prediction = model.predict(input_data)[0]
+    prob = model.predict_proba(input_data)[0][1]
 
-# --------------------------
-# User Inputs
-# --------------------------
-type_map = {"L": 0, "M": 1, "H": 2}
+    st.subheader(" Prediction Result:")
+    if prediction == 1:
+        st.error(f"Machine is likely to FAIL (probability: {prob:.2f})")
+    else:
+        st.success(f" Machine is SAFE (probability of failure: {prob:.2f})")
 
-machine_type = st.selectbox("Machine Type", ["L", "M", "H"])
-air_temp = st.number_input("Air Temperature (°C)", value=300.0)
-proc_temp = st.number_input("Process Temperature (°C)", value=310.0)
-rot_speed = st.number_input("Rotational Speed (rpm)", value=1500)
-torque = st.number_input("Torque (Nm)", value=40.0)
-tool_wear = st.number_input("Tool Wear (min)", value=100.0)
-
-# Prepare input
-input_data = np.array([
-    type_map[machine_type],
-    air_temp,
-    proc_temp,
-    rot_speed,
-    torque,
-    tool_wear
-]).reshape(1, -1)
-
-# --------------------------
-# Prediction
-# --------------------------
-if st.button("Predict Failure"):
-    pred_lr = model_lr.predict(input_data)[0]
-    pred_rf = model_rf.predict(input_data)[0]
-    pred_xgb = model_xgb.predict(input_data)[0]
-    pred_lgbm = model_lgbm.predict(input_data)[0]
-
-    st.subheader("Model Predictions")
-    st.write(f"**Logistic Regression:** {'Failure' if pred_lr else 'No Failure'}")
-    st.write(f"**Random Forest:** {'Failure' if pred_rf else 'No Failure'}")
-    st.write(f"**XGBoost:** {'Failure' if pred_xgb else 'No Failure'}")
-    st.write(f"**LightGBM:** {'Failure' if pred_lgbm else 'No Failure'}")
-
-    # Majority vote
-    total = pred_lr + pred_rf + pred_xgb + pred_lgbm
-    final = "Machine Likely to Fail!" if total >= 2 else "✔️ Machine is Safe"
-
-    st.subheader("Final Verdict")
-    st.success(final) if total < 2 else st.error(final)
+    st.write("---")
+    st.write("### 🌡 Input Summary")
+    st.write(input_data)
