@@ -1,9 +1,9 @@
-# app1.py (fixed)
+# app1.py
 import io
 import os
 import pickle
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 
 import numpy as np
 import pandas as pd
@@ -11,7 +11,7 @@ import requests
 
 import streamlit as st
 
-# Optional plotting / PDF libs
+# Optional dependencies: matplotlib for plots, fpdf for PDF export
 _have_matplotlib = True
 _have_fpdf = True
 try:
@@ -31,7 +31,8 @@ GITHUB_RAW_RELEASE_BASE = "https://github.com/DURVA-GARGGG/machine_failure-app/r
 # -----------------------
 # Helpers: download models from release if missing
 # -----------------------
-def download_asset_if_missing(rel_path: str, release_filename: str) -> Optional[Path]:
+
+def download_asset_if_missing(rel_path: str, release_filename: str) -> Path | None:
     dest = ROOT / rel_path
     if dest.exists():
         return dest
@@ -43,8 +44,7 @@ def download_asset_if_missing(rel_path: str, release_filename: str) -> Optional[
             dest.write_bytes(r.content)
             return dest
     except Exception:
-        # network/download failed -> return None
-        return None
+        pass
     return None
 
 # -----------------------
@@ -52,9 +52,6 @@ def download_asset_if_missing(rel_path: str, release_filename: str) -> Optional[
 # -----------------------
 @st.cache_resource
 def load_models() -> Dict[str, Any]:
-    """
-    Returns dict: model_name -> object OR Exception/FileNotFoundError
-    """
     specs = {
         "Logistic Regression": ("models/final_model_pipeline_lr.pkl", "final_model_pipeline_lr.pkl"),
         "LightGBM": ("models/final_model_pipeline_lgb.pkl", "final_model_pipeline_lgb.pkl"),
@@ -65,17 +62,12 @@ def load_models() -> Dict[str, Any]:
     for name, (rel_path, asset_name) in specs.items():
         p = ROOT / rel_path
         if not p.exists():
-            # try download from releases (best-effort)
-            try:
-                download_asset_if_missing(rel_path, asset_name)
-            except Exception:
-                pass
+            download_asset_if_missing(rel_path, asset_name)
         if p.exists():
             try:
                 with open(p, "rb") as f:
                     loaded[name] = pickle.load(f)
             except Exception as e:
-                # store the exception so UI can show error
                 loaded[name] = e
         else:
             loaded[name] = FileNotFoundError(f"Missing model file: {rel_path}")
@@ -86,6 +78,7 @@ models = load_models()
 # -----------------------
 # Safe predict helper
 # -----------------------
+
 def safe_predict(mdl, X: pd.DataFrame):
     """Return (preds_array_or_None, probs_array_or_None, error_or_None)"""
     try:
@@ -110,11 +103,10 @@ def safe_predict(mdl, X: pd.DataFrame):
 # -----------------------
 st.title("⚙️ Machine Failure Prediction App")
 st.markdown(
-    "Upload sensor CSVs for batch predictions or use the sidebar for a single-sample prediction. "
-    "This app runs LR / LGB / RFR / XGB pipelines and shows an ensemble."
+    "Upload sensor CSVs for batch predictions or use the sidebar for a single-sample prediction. App runs LR / LGB / RFR / XGB pipelines and shows an ensemble."
 )
 
-# Sidebar inputs (single-sample)
+# Sidebar inputs
 st.sidebar.header("Input Features (single sample)")
 air_temp_c = st.sidebar.number_input("Air Temperature (°C)", value=300.0, step=1.0, format="%.2f")
 process_temp_c = st.sidebar.number_input("Process Temperature (°C)", value=305.0, step=1.0, format="%.2f")
@@ -147,23 +139,15 @@ col1, col2 = st.columns([1, 2])
 # -----------------------
 with col1:
     st.header("Single-sample prediction")
-    st.write("Use the sidebar values and press Predict.")
+    st.write("Use the sidebar inputs, choose `Ensemble` or a model and press Predict.")
 
     if st.button("Predict Failure"):
         st.info("Running predictions...")
         model_results: Dict[str, Dict[str, Any]] = {}
-
-        # run models
         for name, mdl in models.items():
-            # missing file
-            if isinstance(mdl, FileNotFoundError):
+            if isinstance(mdl, Exception):
                 model_results[name] = {"error": str(mdl)}
                 continue
-            # model object is an exception (broken pickle)
-            if isinstance(mdl, Exception):
-                model_results[name] = {"error": f"Model load error: {str(mdl)}"}
-                continue
-
             preds, proba, err = safe_predict(mdl, single_df)
             if err:
                 model_results[name] = {"error": str(err)}
@@ -173,7 +157,7 @@ with col1:
                     "proba": float(proba[0]) if proba is not None else None,
                 }
 
-        # ensemble logic
+        # compute ensemble
         probs = [v.get("proba") for v in model_results.values() if v.get("proba") is not None]
         if len(probs) > 0:
             ensemble_prob = float(np.nanmean(probs))
@@ -187,7 +171,7 @@ with col1:
                 ensemble_pred = None
                 ensemble_prob = None
 
-        # Build tidy results table
+        # Build tidy table for display
         rows = []
         for name, res in model_results.items():
             if "error" in res:
@@ -198,11 +182,8 @@ with col1:
                 rows.append({"Model": name, "Prediction": int(pred) if pred is not None else "—", "Prob": f"{prob:.3f}" if prob is not None else "—", "Notes": ""})
 
         df_results = pd.DataFrame(rows)
-
         st.markdown("### Model outputs")
-        # Use st.table for a consistent compact table layout, and also provide dataframe if user wants copy
-        st.table(df_results.set_index("Model"))
-        st.dataframe(df_results.set_index("Model"), use_container_width=True, height=220)
+        st.dataframe(df_results.set_index("Model"), use_container_width=True)
 
         st.markdown("### Ensemble result")
         if ensemble_pred is None:
@@ -219,7 +200,7 @@ with col1:
                 else:
                     st.success("✅ Ensemble: MACHINE SAFE (by majority vote)")
 
-        # chart probabilities if available
+        # probability bar chart (if matplotlib available and probabilities exist)
         if _have_matplotlib:
             model_names = []
             model_probs = []
@@ -271,9 +252,8 @@ with col2:
 
             preds_dict = {}
             probs_dict = {}
-
             for name, mdl in models.items():
-                if isinstance(mdl, FileNotFoundError) or isinstance(mdl, Exception):
+                if isinstance(mdl, Exception):
                     preds_dict[name] = np.full(len(df), np.nan)
                     probs_dict[name] = np.full(len(df), np.nan)
                     continue
@@ -294,7 +274,6 @@ with col2:
             result_df["Ensemble_prob"] = result_df[prob_cols].mean(axis=1, skipna=True)
             if result_df["Ensemble_prob"].isna().all():
                 pred_cols = [c for c in result_df.columns if c.endswith("_pred")]
-                # mode may produce multiple values; take first
                 result_df["Ensemble_vote"] = result_df[pred_cols].mode(axis=1, numeric_only=True)[0]
             else:
                 result_df["Ensemble_pred"] = (result_df["Ensemble_prob"] >= 0.5).astype(int)
@@ -331,10 +310,8 @@ else:
 if st.button("Create & download PDF report (single sample)"):
     model_results = {}
     for name, mdl in models.items():
-        if isinstance(mdl, FileNotFoundError):
+        if isinstance(mdl, Exception):
             model_results[name] = {"error": str(mdl)}
-        elif isinstance(mdl, Exception):
-            model_results[name] = {"error": f"Model load error: {str(mdl)}"}
         else:
             preds, proba, err = safe_predict(mdl, single_df)
             if err:
@@ -358,6 +335,7 @@ if st.button("Create & download PDF report (single sample)"):
     if not _have_fpdf:
         st.error("PDF export not available because fpdf is not installed.")
     else:
+        # create pdf
         pdf = FPDF()
         pdf.add_page()
         pdf.set_font("Arial", "B", 14)
