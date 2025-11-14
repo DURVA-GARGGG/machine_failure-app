@@ -2,6 +2,18 @@ import streamlit as st
 import numpy as np
 import pickle
 
+with open("models/final_model_pipeline_lr.pkl", "rb") as f:
+    model_lr = pickle.load(f)
+
+with open("models/final_model_pipeline_rfr.pkl", "rb") as f:
+    model_rf = pickle.load(f)
+
+with open("models/final_model_pipeline_xgb.pkl", "rb") as f:
+    model_xgb = pickle.load(f)
+
+with open("models/final_model_pipeline_lgb.pkl", "rb") as f:
+    model_lgbm = pickle.load(f)
+
 # --------------------------
 # Load all 4 trained models
 # --------------------------
