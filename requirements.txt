@@ -1,8 +1,10 @@
 streamlit
 pandas
 numpy
-matplotlib
 scikit-learn
 xgboost
 lightgbm
+matplotlib
 fpdf
+requests
+joblib
