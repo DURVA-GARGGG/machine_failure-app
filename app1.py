@@ -1,17 +1,4 @@
 # app1.py
-"""
-Machine Failure Prediction App (app1.py)
-- Old UI style: sidebar single-sample, batch CSV upload, demo CSV support
-- Loads up to 4 model pipelines from models/*.pkl:
-    final_model_pipeline_lr.pkl
-    final_model_pipeline_lgb.pkl
-    final_model_pipeline_rfr.pkl
-    final_model_pipeline_xgb.pkl
-- Gracefully reports missing or broken models.
-- Per-model table, ensemble, probability bar chart (if available), PDF export.
-- Demo CSV support: looks for newcsv.csv in repo root or data/newcsv.csv.
-"""
-
 import io
 import pickle
 from pathlib import Path
@@ -22,7 +9,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-# Optional plotting / PDF libs (not required for main functionality)
+# Optional libs
 _have_matplotlib = True
 _have_fpdf = True
 try:
@@ -40,7 +27,73 @@ st.set_page_config(page_title="Machine Failure — Ensemble", layout="wide", ini
 ROOT = Path(__file__).parent
 GITHUB_RAW_RELEASE_BASE = "https://github.com/DURVA-GARGGG/machine_failure-app/releases/download/models"
 
-# ---------- helper: download release asset if missing ----------
+# ---------- Toy fallback model (no sklearn needed) ----------
+class ToyModel:
+    """
+    Lightweight fallback model that implements predict and predict_proba.
+    Produces deterministic probabilities from a simple linear heuristic on the expected columns.
+    """
+    def __init__(self, name: str):
+        self.name = name
+        self.is_fallback = True
+
+    def _ensure_df(self, X):
+        # Accept DataFrame or array-like: if not DataFrame, try to convert
+        if isinstance(X, pd.DataFrame):
+            return X
+        try:
+            return pd.DataFrame(X)
+        except Exception:
+            raise ValueError("ToyModel expects a DataFrame or convertible input.")
+
+    def _score(self, df: pd.DataFrame):
+        # Use the 5 expected columns (if present) to create a weighted score (0..1)
+        # We try to be robust if columns missing - use whatever available.
+        cols = [
+            "Air temperature [K]",
+            "Process temperature [K]",
+            "Rotational speed [rpm]",
+            "Torque [Nm]",
+            "Tool wear [min]"
+        ]
+        vals = []
+        for c in cols:
+            if c in df.columns:
+                # normalize roughly by a reasonable scale
+                v = df[c].astype(float).fillna(0).values
+                if "temperature" in c.lower():
+                    # divide by 1000 so typical Kelvin ~ 500 -> becomes 0.5
+                    vals.append(v / 1000.0)
+                elif "rotational" in c.lower():
+                    vals.append(v / 5000.0)
+                elif "torque" in c.lower():
+                    vals.append(v / 100.0)
+                else:
+                    vals.append(v / 300.0)
+            else:
+                vals.append(np.zeros(len(df)))
+        # weighted sum
+        weights = np.array([0.25, 0.25, 0.2, 0.15, 0.15])
+        stacked = np.vstack(vals)  # shape (5, n)
+        raw = weights.reshape(-1, 1).T.dot(stacked)  # shape (1, n)
+        raw = raw.ravel()
+        # sigmoid to map to (0,1)
+        probs = 1 / (1 + np.exp(-5*(raw - 0.5)))  # sharpen around 0.5
+        probs = np.clip(probs, 0.001, 0.999)
+        return probs
+
+    def predict_proba(self, X):
+        df = self._ensure_df(X)
+        p = self._score(df)
+        # return shape (n, 2) with columns [prob_0, prob_1]
+        probs = np.vstack([1-p, p]).T
+        return probs
+
+    def predict(self, X):
+        p = self.predict_proba(X)[:, 1]
+        return (p >= 0.5).astype(int)
+
+# ---------- Helpers: download release asset if missing ----------
 def download_asset_if_missing(rel_path: str, release_filename: str) -> Optional[Path]:
     dest = ROOT / rel_path
     if dest.exists():
@@ -68,48 +121,64 @@ def load_models() -> Dict[str, Any]:
     loaded: Dict[str, Any] = {}
     for name, (rel_path, asset_name) in specs.items():
         p = ROOT / rel_path
-        # try local first; if missing, attempt download from release
         if not p.exists():
+            # try download from release (best-effort)
             download_asset_if_missing(rel_path, asset_name)
         if p.exists():
             try:
                 with open(p, "rb") as f:
-                    loaded[name] = pickle.load(f)
+                    mdl = pickle.load(f)
+                # quick sanity: check predict exists
+                if not hasattr(mdl, "predict"):
+                    raise ValueError("Loaded object has no predict()")
+                loaded[name] = mdl
             except Exception as e:
-                # store exception so UI can show it
-                loaded[name] = e
+                # fallback to toy but keep error message in notes
+                loaded[name] = {"fallback": True, "error": str(e), "toy": ToyModel(name)}
         else:
-            loaded[name] = FileNotFoundError(f"Missing model file: {rel_path}")
+            # missing file -> fallback toy model
+            loaded[name] = {"fallback": True, "error": f"Missing model file: {rel_path}", "toy": ToyModel(name)}
     return loaded
 
-models = load_models()
+_models_raw = load_models()
 
-# ---------- Safe predict helper ----------
-def safe_predict(mdl, X: pd.DataFrame) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[Exception]]:
-    """
-    Safely call predict and (optionally) predict_proba.
-    Returns (preds, proba, error). preds/proba are numpy arrays or None.
-    """
-    try:
-        preds = mdl.predict(X)
-        preds = np.array(preds).ravel()
-    except Exception as e:
-        return None, None, e
+# Convert _models_raw to a uniform dict of model objects + note
+# We'll create a dict mapping name -> (model_obj, note)
+models: Dict[str, Dict[str, Any]] = {}
+for name, entry in _models_raw.items():
+    if isinstance(entry, dict) and entry.get("fallback"):
+        models[name] = {"model": entry["toy"], "note": entry.get("error", "Using fallback toy model")}
+    else:
+        models[name] = {"model": entry, "note": None}
 
-    proba = None
+# ---------- Safe predict wrapper ----------
+def safe_predict_wrapper(mdl_entry, X: pd.DataFrame) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[str]]:
+    """
+    mdl_entry is the dict stored in models[name] -> {'model': obj, 'note': maybe_string}
+    Returns (preds, prob, note)
+    - If model is a fallback toy, we return its outputs and the note.
+    - If real model raises errors, return None and the error message as note.
+    """
+    note = mdl_entry.get("note")
+    mdl = mdl_entry["model"]
     try:
+        preds, proba, err = None, None, None
+        if hasattr(mdl, "predict"):
+            preds = mdl.predict(X)
+        else:
+            raise ValueError("Model object has no predict()")
         if hasattr(mdl, "predict_proba"):
             p = mdl.predict_proba(X)
             if getattr(p, "ndim", 0) == 2 and p.shape[1] >= 2:
                 proba = np.array(p)[:, 1]
             else:
                 proba = None
-    except Exception:
-        proba = None
+        return np.array(preds).ravel(), (np.array(proba).ravel() if proba is not None else None), note
+    except Exception as e:
+        # if model is toy it shouldn't fail; otherwise return error note
+        return None, None, str(e) if note is None else note + " | " + str(e)
 
-    return preds, proba, None
-
-# ---------- CSV utilities ----------
+# ---------- CSV utils ----------
 REQUIRED_COLUMNS = [
     "Air temperature [K]",
     "Process temperature [K]",
@@ -128,14 +197,11 @@ def validate_columns(df: pd.DataFrame) -> Tuple[bool, List[str]]:
     missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
     return (len(missing) == 0), missing
 
-# ---------- UI header ----------
+# ---------- UI ----------
 st.title("⚙️ Machine Failure Prediction App")
-st.markdown(
-    "Upload sensor CSVs for batch predictions **or** use the sidebar for single-sample predictions. "
-    "This app runs LR / LGB / RFR / XGB pipelines and shows per-model outputs + an ensemble."
-)
+st.markdown("Upload CSVs for batch predictions or use the sidebar for single-sample. Fallback toy models used when real pipelines missing or broken. ✅")
 
-# ---------- Sidebar: single-sample ----------
+# Sidebar single-sample
 st.sidebar.header("Input Features (single sample)")
 air_temp_c = st.sidebar.number_input("Air Temperature (°C)", value=300.0, step=1.0, format="%.2f")
 process_temp_c = st.sidebar.number_input("Process Temperature (°C)", value=305.0, step=1.0, format="%.2f")
@@ -148,9 +214,8 @@ single_model_choice = st.sidebar.selectbox("Choose model for single-sample (or '
 st.sidebar.markdown("---")
 allow_downloads = st.sidebar.checkbox("Allow per-file CSV download (batch)", value=True)
 show_head = st.sidebar.checkbox("Show head preview (batch)", value=True)
-st.sidebar.caption("Tip: Add `newcsv.csv` to repo root or data/ to enable demo.")
+st.sidebar.caption("Add 'newcsv.csv' at repo root or data/ to enable demo.")
 
-# helper to build single-sample DataFrame (pipelines expect Kelvin)
 def build_input_df(air_c, proc_c, rpm, tq, wear) -> pd.DataFrame:
     return pd.DataFrame({
         "Air temperature [K]": [air_c + 273.15],
@@ -162,11 +227,11 @@ def build_input_df(air_c, proc_c, rpm, tq, wear) -> pd.DataFrame:
 
 single_df = build_input_df(air_temp_c, process_temp_c, rot_speed, torque, tool_wear)
 
-# ---------- run-batch helper ----------
+# ---------- run batch ----------
 def run_batch_on_df(df: pd.DataFrame, source_name: str) -> Optional[pd.DataFrame]:
     ok, missing = validate_columns(df)
     if not ok:
-        st.error(f"File `{source_name}` is missing required columns: {missing}. See example template.")
+        st.error(f"File `{source_name}` missing columns: {missing}. Use the example template.")
         return None
 
     if show_head:
@@ -175,24 +240,18 @@ def run_batch_on_df(df: pd.DataFrame, source_name: str) -> Optional[pd.DataFrame
 
     preds_dict = {}
     probs_dict = {}
-    model_msgs = {}
+    notes_dict = {}
 
-    for name, mdl in models.items():
-        if isinstance(mdl, Exception):
-            model_msgs[name] = str(mdl)
-            preds_dict[name] = np.full(len(df), np.nan)
-            probs_dict[name] = np.full(len(df), np.nan)
-            continue
-        preds, proba, err = safe_predict(mdl, df)
-        if err:
-            model_msgs[name] = str(err)
+    for name, entry in models.items():
+        preds, proba, note = safe_predict_wrapper(entry, df)
+        if preds is None:
             preds_dict[name] = np.full(len(df), np.nan)
             probs_dict[name] = np.full(len(df), np.nan)
         else:
             preds_dict[name] = np.asarray(preds)
             probs_dict[name] = np.asarray(proba) if proba is not None else np.full(len(df), np.nan)
+        notes_dict[name] = note or ""
 
-    # assemble result dataframe
     result_df = pd.DataFrame(index=np.arange(len(df)))
     for name in models.keys():
         result_df[name + "_pred"] = preds_dict.get(name, np.full(len(df), np.nan))
@@ -201,7 +260,6 @@ def run_batch_on_df(df: pd.DataFrame, source_name: str) -> Optional[pd.DataFrame
     prob_cols = [c for c in result_df.columns if c.endswith("_prob")]
     result_df["Ensemble_prob"] = result_df[prob_cols].mean(axis=1, skipna=True)
 
-    # If no probabilities, do majority vote on predictions
     if result_df["Ensemble_prob"].isna().all():
         pred_cols = [c for c in result_df.columns if c.endswith("_pred")]
         if pred_cols:
@@ -219,6 +277,11 @@ def run_batch_on_df(df: pd.DataFrame, source_name: str) -> Optional[pd.DataFrame
         result_df.insert(0, "id", df["id"].values)
     result_df.insert(0, "source_file", source_name)
 
+    # small table of model notes for this file (helps to see fallback)
+    notes_rows = [{"Model": name, "Notes": notes_dict.get(name, "")} for name in models.keys()]
+    st.markdown("**Model Notes**")
+    st.table(pd.DataFrame(notes_rows).set_index("Model"))
+
     st.success(f"Predictions generated for `{source_name}` ✅")
     st.dataframe(result_df.head(10))
     if allow_downloads:
@@ -227,38 +290,33 @@ def run_batch_on_df(df: pd.DataFrame, source_name: str) -> Optional[pd.DataFrame
 
     return result_df
 
-# ---------- Layout: two columns ----------
+# ---------- Layout ----------
 col1, col2 = st.columns([1, 2])
 
-# LEFT: Single-sample + model table + ensemble + chart
 with col1:
     st.header("Single-sample prediction")
-    st.write("Use the sidebar inputs, choose a model (or Ensemble) and press Predict.")
+    st.write("Fill sidebar values and press Predict.")
 
     if st.button("Predict Failure"):
         st.info("Running predictions...")
-        # run each model on the single sample
         model_results: Dict[str, Dict[str, Any]] = {}
-        for name, mdl in models.items():
-            if isinstance(mdl, Exception):
-                model_results[name] = {"error": str(mdl)}
-                continue
-            preds, proba, err = safe_predict(mdl, single_df)
-            if err:
-                model_results[name] = {"error": str(err)}
-            else:
-                model_results[name] = {
-                    "pred": int(preds[0]) if preds is not None else None,
-                    "proba": float(proba[0]) if proba is not None else None,
-                }
+        notes_for_table = {}
 
-        # prepare ensemble
-        probs = [v.get("proba") for v in model_results.values() if v.get("proba") is not None]
+        for name, entry in models.items():
+            preds, proba, note = safe_predict_wrapper(entry, single_df)
+            if preds is None:
+                model_results[name] = {"pred": None, "proba": None, "note": note}
+            else:
+                model_results[name] = {"pred": int(preds[0]), "proba": float(proba[0]) if proba is not None else None, "note": note}
+            notes_for_table[name] = model_results[name]["note"] or ""
+
+        # ensemble
+        probs = [v["proba"] for v in model_results.values() if v["proba"] is not None]
         if len(probs) > 0:
             ensemble_prob = float(np.nanmean(probs))
             ensemble_pred = int(ensemble_prob >= 0.5)
         else:
-            preds_only = [v.get("pred") for v in model_results.values() if v.get("pred") is not None]
+            preds_only = [v["pred"] for v in model_results.values() if v["pred"] is not None]
             if len(preds_only) > 0:
                 ensemble_pred = int(round(np.mean(preds_only)))
                 ensemble_prob = None
@@ -266,28 +324,19 @@ with col1:
                 ensemble_pred = None
                 ensemble_prob = None
 
-        # neat display table
+        # show table
         rows = []
         for name, res in model_results.items():
-            if "error" in res:
-                rows.append({"Model": name, "Prediction": "ERROR", "Prob": "—", "Notes": res.get("error")})
+            if res["pred"] is None:
+                rows.append({"Model": name, "Prediction": "ERROR", "Prob": "—", "Notes": res["note"] or ""})
             else:
-                pred = res.get("pred")
-                prob = res.get("proba")
-                rows.append({
-                    "Model": name,
-                    "Prediction": int(pred) if pred is not None else "—",
-                    "Prob": f"{prob:.3f}" if prob is not None else "—",
-                    "Notes": ""
-                })
-        df_results = pd.DataFrame(rows)
+                rows.append({"Model": name, "Prediction": res["pred"], "Prob": f"{res['proba']:.3f}" if res["proba"] is not None else "—", "Notes": res["note"] or ""})
         st.markdown("### Model outputs")
-        st.dataframe(df_results.set_index("Model"), use_container_width=True)
+        st.dataframe(pd.DataFrame(rows).set_index("Model"), use_container_width=True)
 
-        # Ensemble card
         st.markdown("### Ensemble result")
         if ensemble_pred is None:
-            st.warning("No successful model outputs to produce an ensemble.")
+            st.warning("No successful outputs to produce an ensemble.")
         else:
             if ensemble_pred == 1:
                 if ensemble_prob is not None:
@@ -300,38 +349,37 @@ with col1:
                 else:
                     st.success("✅ Ensemble: MACHINE SAFE (by majority vote)")
 
-        # Plot probabilities if present
+        # chart
         if _have_matplotlib:
-            model_names = []
-            model_probs = []
-            for name, res in model_results.items():
-                if "error" in res:
-                    continue
-                p = res.get("proba")
-                if p is not None:
-                    model_names.append(name)
-                    model_probs.append(p)
-            if model_probs:
+            names = []
+            probs_plot = []
+            for n, r in model_results.items():
+                if r["probo := r.get('proba')"] if False else True:  # no-op to keep formatting consistent
+                    pass
+            # collect properly
+            for n, r in model_results.items():
+                if r["proba"] is not None:
+                    names.append(n)
+                    probs_plot.append(r["proba"])
+            if probs_plot:
                 fig, ax = plt.subplots(figsize=(5, 2.2))
-                ax.barh(model_names, model_probs, height=0.5)
+                ax.barh(names, probs_plot, height=0.5)
                 ax.set_xlim(0, 1)
                 ax.set_xlabel("Failure probability")
                 ax.set_title("Model failure probabilities")
-                for i, v in enumerate(model_probs):
-                    ax.text(v + 0.01, i, f"{v:.2f}", va='center')
+                for i, v in enumerate(probs_plot):
+                    ax.text(v + 0.01, i, f"{v:.2f}", va="center")
                 st.pyplot(fig)
             else:
-                st.info("No probability outputs available for bar chart (models may not expose predict_proba).")
+                st.info("No probability outputs available for chart.")
         else:
-            st.info("Plotting disabled: matplotlib not installed in environment.")
+            st.info("Plotting disabled (matplotlib missing).")
 
-# RIGHT: Batch upload + Demo + combined results
 with col2:
     st.header("Batch prediction — CSV upload")
-    st.write("Upload one or more CSV files with sensor features (or run the demo `newcsv.csv`).")
+    st.write("Upload CSV files or run demo `newcsv.csv` (place at repo root or data/).")
 
-    # Demo support: look for newcsv.csv at repo root or data/
-    st.markdown("#### Demo / Testcase")
+    # Demo support
     demo_paths = [ROOT / "newcsv.csv", ROOT / "data" / "newcsv.csv"]
     demo_found = None
     for p in demo_paths:
@@ -350,13 +398,12 @@ with col2:
             if demo_df is not None:
                 run_batch_on_df(demo_df, str(demo_found.name))
     else:
-        st.info("No demo CSV found in repo. Add `newcsv.csv` to repo root or data/ to enable demo.")
+        st.info("No demo CSV found in repo. Upload `newcsv.csv` to repo root or `data/`.")
 
     uploaded_files = st.file_uploader("Upload CSV files (accepts multiple)", type=["csv"], accept_multiple_files=True)
-
     all_results = []
     if uploaded_files:
-        progress_bar = st.progress(0)
+        prog = st.progress(0)
         total = len(uploaded_files)
         for idx, f in enumerate(uploaded_files, start=1):
             st.subheader(f.name)
@@ -368,40 +415,38 @@ with col2:
             res = run_batch_on_df(df, f.name)
             if res is not None:
                 all_results.append(res)
-            progress_bar.progress(idx / total)
-
+            prog.progress(idx / total)
         if all_results:
             combined = pd.concat(all_results, ignore_index=True)
             st.header("Combined predictions preview")
             st.dataframe(combined.head(30))
             st.download_button("Download combined CSV", combined.to_csv(index=False).encode(), "combined_predictions.csv")
 
-# ---------- PDF report (single sample) ----------
+# ---------- PDF export ----------
 st.markdown("---")
 st.header("Export a PDF report (single-sample)")
 if _have_fpdf:
     st.write("PDF export available.")
 else:
-    st.info("PDF export disabled: 'fpdf' not installed in this environment.")
+    st.info("PDF export disabled (fpdf missing).")
 
 if st.button("Create & download PDF report (single sample)"):
+    # Re-run single-sample predictions for the report
     model_results = {}
-    for name, mdl in models.items():
-        if isinstance(mdl, Exception):
-            model_results[name] = {"error": str(mdl)}
+    for name, entry in models.items():
+        preds, proba, note = safe_predict_wrapper(entry, single_df)
+        if preds is None:
+            model_results[name] = {"pred": None, "proba": None, "note": note}
         else:
-            preds, proba, err = safe_predict(mdl, single_df)
-            if err:
-                model_results[name] = {"error": str(err)}
-            else:
-                model_results[name] = {"pred": int(preds[0]), "proba": float(proba[0]) if proba is not None else None}
+            model_results[name] = {"pred": int(preds[0]), "proba": float(proba[0]) if proba is not None else None, "note": note}
 
-    probs = [v.get("proba") for v in model_results.values() if v.get("proba") is not None]
+    # ensemble same as before
+    probs = [v["proba"] for v in model_results.values() if v["proba"] is not None]
     if len(probs) > 0:
         ensemble_prob = float(np.nanmean(probs))
         ensemble_pred = int(ensemble_prob >= 0.5)
     else:
-        preds_only = [v.get("pred") for v in model_results.values() if v.get("pred") is not None]
+        preds_only = [v["pred"] for v in model_results.values() if v["pred"] is not None]
         if len(preds_only) > 0:
             ensemble_pred = int(round(np.mean(preds_only)))
             ensemble_prob = None
@@ -410,7 +455,7 @@ if st.button("Create & download PDF report (single sample)"):
             ensemble_prob = None
 
     if not _have_fpdf:
-        st.error("PDF export not available because fpdf is not installed.")
+        st.error("FPDF not installed; can't create PDF.")
     else:
         pdf = FPDF()
         pdf.add_page()
@@ -424,10 +469,10 @@ if st.button("Create & download PDF report (single sample)"):
         pdf.ln(4)
         pdf.cell(0, 8, "Model outputs:", ln=True)
         for name, res in model_results.items():
-            if "error" in res:
-                pdf.cell(0, 6, f" - {name}: ERROR ({res['error']})", ln=True)
+            if res["pred"] is None:
+                pdf.cell(0, 6, f" - {name}: ERROR ({res['note']})", ln=True)
             else:
-                if res.get("proba") is not None:
+                if res["proba"] is not None:
                     pdf.cell(0, 6, f" - {name}: pred={res['pred']}, prob={res['proba']:.3f}", ln=True)
                 else:
                     pdf.cell(0, 6, f" - {name}: pred={res['pred']}", ln=True)
@@ -444,7 +489,4 @@ if st.button("Create & download PDF report (single sample)"):
         st.download_button("Download PDF report", out, file_name="machine_failure_report.pdf", mime="application/pdf")
 
 st.markdown("---")
-st.caption(
-    "If a model file is missing the app attempts to download it from the repo releases. "
-    "For best reliability add `models/*.pkl` into the repository before redeploying."
-)
+st.caption("If a real model file is missing the app uses a small deterministic ToyModel so you can demo the UI. For proper predictions deploy trained pipelines in models/*.pkl")
