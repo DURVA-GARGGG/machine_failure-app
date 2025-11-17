@@ -1,114 +1,119 @@
-# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
-import joblib
-import os
-from pathlib import Path
-import requests
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from lightgbm import LGBMClassifier
+from xgboost import XGBClassifier
 
-st.set_page_config(page_title="Machine Failure — Ensemble Predictions", layout="wide")
+st.set_page_config(page_title="Brain Tumor Classifier", layout="wide")
 
-###########################################
-# DOWNLOAD MODELS FROM RELEASES
-###########################################
+st.title("🧠 Brain Tumor Classifier")
 
-MODEL_DIR = Path("models")
-MODEL_DIR.mkdir(exist_ok=True)
+# -------------------------------
+# 1️⃣ LOAD YOUR DATASET SAFELY
+# -------------------------------
+FILE_PATH = "newcsv.csv"   # FINAL FIXED NAME
 
-MODEL_URLS = {
-    "LightGBM": "https://github.com/DURVA-GARGGG/machine_failure-app/releases/download/v1/final_model_pipeline_lgb.pkl",
-    "Logistic Regression": "https://github.com/DURVA-GARGGG/machine_failure-app/releases/download/v1/final_model_pipeline_lr.pkl",
-    "Random Forest": "https://github.com/DURVA-GARGGG/machine_failure-app/releases/download/v1/final_model_pipeline_rfr.pkl",
-    "XGBoost": "https://github.com/DURVA-GARGGG/machine_failure-app/releases/download/v1/final_model_pipeline_xgb.pkl",
-}
+@st.cache_data
+def load_data():
+    try:
+        df = pd.read_csv(FILE_PATH)
+        return df, None
+    except Exception as e:
+        return None, str(e)
 
-def download_models():
-    for name, url in MODEL_URLS.items():
-        filename = MODEL_DIR / url.split("/")[-1]
-        if not filename.exists():
-            r = requests.get(url)
-            open(filename, "wb").write(r.content)
+df, error = load_data()
 
-download_models()
-
-###########################################
-# LOAD MODELS
-###########################################
-
-@st.cache_resource
-def load_models():
-    models = {}
-    for name, url in MODEL_URLS.items():
-        filename = MODEL_DIR / url.split("/")[-1]
-        try:
-            models[name] = joblib.load(filename)
-        except Exception as e:
-            models[name] = e
-    return models
-
-models = load_models()
-
-###########################################
-# STREAMLIT UI
-###########################################
-
-st.title("Machine Failure Prediction — Ensemble Models")
-st.write("Upload CSV files to generate predictions.")
-
-uploaded_files = st.file_uploader("Upload CSV files", type=["csv"], accept_multiple_files=True)
-
-if not uploaded_files:
-    st.info("Upload CSV files to continue.")
+if error:
+    st.error(f"❌ Could not load '{FILE_PATH}'. Make sure the file exists.\n\nError: {error}")
     st.stop()
 
-show_head = st.checkbox("Show first 5 rows", value=True)
+st.success("✅ Dataset loaded successfully!")
 
-all_results = []
+st.write("### Preview of your data")
+st.dataframe(df.head())
 
-for f in uploaded_files:
-    st.subheader(f.name)
+# ---------------------------------
+# 2️⃣ PREPARE FEATURES + LABEL
+# ---------------------------------
+X = df.drop(columns=["Tumor"])
+y = df["Tumor"]
 
+# ---------------------------------
+# 3️⃣ TRAIN-TEST SPLIT
+# ---------------------------------
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42
+)
+
+# ---------------------------------
+# 4️⃣ BUILD ALL 4 MODELS
+# ---------------------------------
+models = {
+    "Logistic Regression": Pipeline([
+        ("scaler", StandardScaler()),
+        ("clf", LogisticRegression())
+    ]),
+
+    "LightGBM": LGBMClassifier(),
+
+    "Random Forest": RandomForestClassifier(),
+
+    "XGBoost": XGBClassifier(
+        eval_metric="logloss",
+        use_label_encoder=False
+    )
+}
+
+# ---------------------------------
+# 5️⃣ FIT MODELS SAFELY
+# ---------------------------------
+status = {}
+
+for name, model in models.items():
     try:
-        df = pd.read_csv(f)
+        model.fit(X_train, y_train)
+        status[name] = "fitted"
     except Exception as e:
-        st.error(f"Error reading {f.name}: {e}")
+        status[name] = f"ERROR: {e}"
+
+# ---------------------------------
+# 6️⃣ USER INPUT — SIMPLE TEST CASE
+# ---------------------------------
+st.write("### 🔍 Enter Tumor Features for Prediction")
+
+user_input = {}
+for col in X.columns:
+    user_input[col] = st.number_input(f"{col}", value=float(df[col].mean()))
+
+user_data = pd.DataFrame([user_input])
+
+# ---------------------------------
+# 7️⃣ SHOW RESULTS TABLE
+# ---------------------------------
+st.write("### 📌 Model Predictions")
+
+result_table = []
+
+for name, model in models.items():
+    if status[name] != "fitted":
+        result_table.append([name, "ERROR", "—", status[name]])
         continue
 
-    if show_head:
-        st.dataframe(df.head())
+    try:
+        pred = model.predict(user_data)[0]
+        prob = model.predict_proba(user_data)[0].max()
+        result_table.append([name, pred, f"{prob:.4f}", "OK"])
+    except Exception as e:
+        result_table.append([name, "ERROR", "—", str(e)])
 
-    preds_dict = {}
+final_df = pd.DataFrame(
+    result_table,
+    columns=["Model", "Prediction", "Probability", "Status"]
+)
 
-    for name, mdl in models.items():
-        try:
-            preds = mdl.predict(df)
-            preds_dict[name] = np.array(preds).ravel()
-        except Exception as e:
-            preds_dict[name] = f"Error: {e}"
-
-    # Build result DataFrame
-    result_df = pd.DataFrame(preds_dict)
-
-    # Ensemble
-    numeric_cols = result_df.select_dtypes(include=[np.number])
-    result_df["Ensemble_Average"] = numeric_cols.mean(axis=1)
-
-    st.dataframe(result_df.head())
-
-    csv = result_df.to_csv(index=False).encode()
-    st.download_button(f"Download results for {f.name}", csv, f"{f.name}_predictions.csv")
-
-    result_df.insert(0, "source_file", f.name)
-    all_results.append(result_df)
-
-if all_results:
-    final_output = pd.concat(all_results, ignore_index=True)
-    st.header("Combined Predictions")
-    st.dataframe(final_output.head())
-
-    st.download_button(
-        "Download Combined CSV",
-        final_output.to_csv(index=False).encode(),
-        "combined_predictions.csv",
-    )
+st.dataframe(final_df, use_container_width=True)
