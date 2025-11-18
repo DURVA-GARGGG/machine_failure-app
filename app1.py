@@ -2,14 +2,16 @@
 import io
 import pickle
 from pathlib import Path
-from typing import Dict, Any, Optional, Tuple, List
+from typing import Dict, Any
 
+import joblib
 import numpy as np
 import pandas as pd
 import requests
+
 import streamlit as st
 
-# Optional libs
+
 _have_matplotlib = True
 _have_fpdf = True
 try:
@@ -22,7 +24,7 @@ try:
 except Exception:
     _have_fpdf = False
 
-# ---------- Config ----------
+
 st.set_page_config(page_title="Machine Failure — Ensemble", layout="wide", initial_sidebar_state="expanded")
 ROOT = Path(__file__).parent
 GITHUB_RAW_RELEASE_BASE = "https://github.com/DURVA-GARGGG/machine_failure-app/releases/download/models"
@@ -224,6 +226,11 @@ def build_input_df(air_c, proc_c, rpm, tq, wear) -> pd.DataFrame:
         "Torque [Nm]": [tq],
         "Tool wear [min]": [wear],
     })
+    # Add engineered features
+    df["del_T"] = df["Process temperature [K]"] - df["Air temperature [K]"]
+    df["power proxy"] = df["Rotational speed [rpm]"] * df["Torque [Nm]"]
+    df["wear_rate"] = df["Tool wear [min]"] / df["Rotational speed [rpm]"]
+    return df
 
 single_df = build_input_df(air_temp_c, process_temp_c, rot_speed, torque, tool_wear)
 
@@ -402,15 +409,18 @@ with col2:
 
     uploaded_files = st.file_uploader("Upload CSV files (accepts multiple)", type=["csv"], accept_multiple_files=True)
     all_results = []
+    bad_files = []
     if uploaded_files:
         prog = st.progress(0)
         total = len(uploaded_files)
         for idx, f in enumerate(uploaded_files, start=1):
             st.subheader(f.name)
+
             try:
-                df = read_csv_bytes_or_file(f)
+                df = pd.read_csv(f)
             except Exception as e:
                 st.error(f"Could not read {f.name}: {e}")
+                bad_files.append(f.name)
                 continue
             res = run_batch_on_df(df, f.name)
             if res is not None:
@@ -457,6 +467,7 @@ if st.button("Create & download PDF report (single sample)"):
     if not _have_fpdf:
         st.error("FPDF not installed; can't create PDF.")
     else:
+        # create pdf
         pdf = FPDF()
         pdf.add_page()
         pdf.set_font("Arial", "B", 14)
@@ -484,7 +495,7 @@ if st.button("Create & download PDF report (single sample)"):
             pdf.cell(0, 6, f"Ensemble pred: {ensemble_pred}; prob: {ensemble_prob}", ln=True)
 
         out = io.BytesIO()
-        out.write(pdf.output(dest="S").encode("latin1"))
+        out.write(pdf.output(dest='S').encode('latin1'))
         out.seek(0)
         st.download_button("Download PDF report", out, file_name="machine_failure_report.pdf", mime="application/pdf")
 
